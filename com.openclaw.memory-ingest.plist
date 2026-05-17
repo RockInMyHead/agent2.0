@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.memory-ingest</string>
+
+    <key>Comment</key>
+    <string>OpenClaw Memory Tree — periodic ingest every hour</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/artem/Desktop/code/openclaw-memory/src/cli.js</string>
+        <string>ingest</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/artem/Desktop/code/openclaw-memory</string>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/artem/.openclaw/memory/logs/ingest-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/artem/.openclaw/memory/logs/ingest-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>OPENCLAW_HOME</key>
+        <string>/Users/artem/.openclaw</string>
+        <key>OPENCLAW_WORKSPACE</key>
+        <string>/Users/artem/.openclaw/workspace</string>
+        <key>OPENCLAW_MEMORY_DB</key>
+        <string>/Users/artem/.openclaw/memory/memory.db</string>
+        <key>OPENCLAW_MEMORY_VAULT</key>
+        <string>/Users/artem/.openclaw/workspace/wiki</string>
+    </dict>
+</dict>
+</plist>
