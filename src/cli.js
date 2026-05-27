@@ -4,8 +4,25 @@ import { existsSync, readFileSync, statSync, readdirSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolveConfig, ensureDirectories } from "./config.js";
 import { createDb, tokenEstimate } from "./db.js";
-import { ingestAllSources } from "./ingest.js";
+import { ingestAllSources, ingestFile } from "./ingest.js";
 import { summarizeAll } from "./summarize.js";
+import { exportDataset } from "./export-dataset.js";
+import { join, basename } from "node:path";
+
+/** Escape a string for safe use in FTS5 MATCH queries.
+ *  Removes FTS5 special chars and numbers-only tokens (which FTS5
+ *  would interpret as column references), wraps remaining words
+ *  with prefix matching.
+ */
+function buildFtsQuery(raw) {
+  const tokens = raw
+    .replace(/['"]/g, "")
+    .replace(/[-.+*^$(){}|\[\]\\?!@~`#]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !/^\d+$/.test(w));
+  if (tokens.length === 0) return "";
+  return tokens.map((w) => `${w}*`).join(" OR ");
+}
 
 const COMMANDS = [
   "init",
@@ -15,6 +32,7 @@ const COMMANDS = [
   "recall",
   "status",
   "open-vault",
+  "export-sft",
   "help",
 ];
 
@@ -33,6 +51,7 @@ COMMANDS:
   recall "<query>"      Return compact Markdown context for agent
   status                Show memory statistics
   open-vault            Open Obsidian vault (macOS)
+  export-sft [dir]      Export SFT dataset from sessions + Obsidian vault
   help                  Show this help
 
 ENV:
@@ -153,7 +172,8 @@ function cmdSearch(cfg, query) {
   let results;
   if (hasFts) {
     // FTS5 search with prefix matching
-    const ftsQuery = query.split(/\s+/).filter((w) => w.length >= 2).map((w) => `${w}*`).join(" OR ");
+    const ftsQuery = buildFtsQuery(query);
+    if (!ftsQuery) { results = []; } else {
     results = db.prepare(`
       SELECT c.id, c.title, c.content, c.source_id, c.token_estimate, c.created_at,
              substr(c.content, 1, 300) as snippet,
@@ -165,6 +185,7 @@ function cmdSearch(cfg, query) {
       ORDER BY rank
       LIMIT 10
     `).all(ftsQuery);
+    }
   } else {
     // LIKE fallback
     const likeQuery = `%${query}%`;
@@ -183,7 +204,8 @@ function cmdSearch(cfg, query) {
   // Also search summaries
   let summaries;
   if (hasFts) {
-    const ftsQuery = query.split(/\s+/).filter((w) => w.length >= 2).map((w) => `${w}*`).join(" OR ");
+    const ftsQuery = buildFtsQuery(query);
+    if (ftsQuery) {
     summaries = db.prepare(`
       SELECT summaries.id, summaries.scope, summaries.scope_key, summaries.title, summaries.content, summaries.markdown_path,
              substr(summaries.content, 1, 300) as snippet
@@ -193,6 +215,7 @@ function cmdSearch(cfg, query) {
       ORDER BY rank
       LIMIT 5
     `).all(ftsQuery);
+    } else { summaries = []; }
   } else {
     const likeQuery = `%${query}%`;
     summaries = db.prepare(`
@@ -255,7 +278,8 @@ function cmdRecall(cfg, query) {
   // First: find relevant summaries
   let summaries;
   if (hasFts) {
-    const ftsQuery = query.split(/\s+/).filter((w) => w.length >= 2).map((w) => `${w}*`).join(" OR ");
+    const ftsQuery = buildFtsQuery(query);
+    if (ftsQuery) {
     summaries = db.prepare(`
       SELECT summaries.scope, summaries.scope_key, summaries.title, summaries.content, summaries.markdown_path
       FROM summaries
@@ -264,6 +288,7 @@ function cmdRecall(cfg, query) {
       ORDER BY summaries.level ASC, rank
       LIMIT 5
     `).all(ftsQuery);
+    } else { summaries = []; }
   } else {
     const likeQuery = `%${query}%`;
     summaries = db.prepare(`
@@ -295,7 +320,8 @@ function cmdRecall(cfg, query) {
   // Then: find relevant chunks
   let chunks;
   if (hasFts) {
-    const ftsQuery = query.split(/\s+/).filter((w) => w.length >= 2).map((w) => `${w}*`).join(" OR ");
+    const ftsQuery = buildFtsQuery(query);
+    if (ftsQuery) {
     chunks = db.prepare(`
       SELECT c.id, c.title, c.content, c.source_id, c.token_estimate, c.markdown_path,
              s.title as source_title, s.kind as source_kind
@@ -306,6 +332,7 @@ function cmdRecall(cfg, query) {
       ORDER BY rank
       LIMIT 5
     `).all(ftsQuery);
+    } else { chunks = []; }
   } else {
     const likeQuery = `%${query}%`;
     chunks = db.prepare(`
@@ -403,6 +430,18 @@ function cmdStatus(cfg) {
   }
 }
 
+function cmdExportSft(cfg, outArg) {
+  const outDir = outArg || join(cfg.OPENCLAW_HOME, "datasets", `agent-sft-${new Date().toISOString().slice(0, 10)}`);
+  console.log(`[memory]  Exporting SFT dataset → ${outDir}\n`);
+  const stats = exportDataset(cfg, outDir);
+  console.log("[memory]  ✓ Dataset exported:\n");
+  for (const [k, v] of Object.entries(stats.counts)) {
+    console.log(`    ${k}: ${v}`);
+  }
+  console.log(`\n  Output: ${outDir}`);
+  console.log(`  Stats:  ${join(outDir, "dataset_stats.json")}\n`);
+}
+
 function cmdOpenVault(cfg) {
   const vaultPath = cfg.OPENCLAW_MEMORY_VAULT;
 
@@ -463,5 +502,8 @@ switch (cmd) {
     break;
   case "open-vault":
     cmdOpenVault(cfg);
+    break;
+  case "export-sft":
+    cmdExportSft(cfg, query);
     break;
 }

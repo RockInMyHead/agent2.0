@@ -1,0 +1,22 @@
+{
+  "exported_at": "2026-05-24T19:55:12.474Z",
+  "output_dir": "/Users/artem/Desktop/code/openclaw-memory/datasets/agent-sft-2026-05-24",
+  "counts": {
+    "conversations": 100,
+    "instructions": 246,
+    "agent": 97,
+    "cad_stl": 80,
+    "knowledge_qa": 150,
+    "tool_use": 111
+  },
+  "categories": {
+    "general": 108,
+    "agent": 93,
+    "cad": 45
+  },
+  "sources": {
+    "sessions_dir": "/Users/artem/.openclaw/agents/main/sessions",
+    "vault": "/Users/artem/.openclaw/workspace/wiki",
+    "scad_files": 10
+  }
+}

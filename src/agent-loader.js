@@ -45,18 +45,27 @@ function extractKeyTerms(prompt) {
   return [...new Set(terms)];
 }
 
+/** Escape a string for safe use in FTS5 MATCH queries.
+ *  Removes FTS5 special chars and numbers-only tokens (which FTS5
+ *  would interpret as column references), wraps remaining words
+ *  with prefix matching.
+ */
+function buildFtsQuery(raw) {
+  const tokens = raw
+    .replace(/['"]/g, "")
+    .replace(/[-.+*^$(){}|\[\]\\?!@~`#]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !/^\d+$/.test(w));
+  if (tokens.length === 0) return "";
+  return tokens.map((w) => `${w}*`).join(" OR ");
+}
+
 function searchMemory(db, hasFts, query, maxTokens) {
   const output = [];
   let totalTokens = 0;
 
-  const ftsQuery = query
-    .replace(/[^a-zA-Z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 3)
-    .map((w) => `${w}*`)
-    .join(" OR ");
-
-  if (!ftsQuery.trim()) return output;
+  const ftsQuery = buildFtsQuery(query);
+  if (!ftsQuery) return output;
 
   // Search summaries
   let summaries;
