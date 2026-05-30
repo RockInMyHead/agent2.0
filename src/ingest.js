@@ -1,7 +1,8 @@
 import { readFileSync, readdirSync, statSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, relative, basename, dirname, extname } from "node:path";
+import { join, relative, basename, extname } from "node:path";
 import { createHash } from "node:crypto";
-import { createDb, generateId, tokenEstimate, now } from "./db.js";
+import { generateId, tokenEstimate, now } from "./db.js";
+import { deleteVaultPaths, collectVaultPathsForSource, pruneOrphanVaultFiles } from "./vault-cleanup.js";
 
 const IGNORE_PATTERNS = [
   /\.env$/,
@@ -14,7 +15,25 @@ const IGNORE_PATTERNS = [
   /\/build\//,
   /\/logs\//,
   /memory\.db$/,
+  /__pycache__(\/|$)/,
+  /\.venv(\/|$)/,
+  /\/venv\//,
+  /\.tmp(\/|$)/,
+  /\.cache(\/|$)/,
 ];
+
+const SESSION_SKIP_PATTERNS = [
+  /\.trajectory\.jsonl$/,
+  /\.checkpoint\./,
+  /\.reset\./,
+  /^sessions\.json$/,
+];
+
+const TOPIC_NOISE = new Set([
+  "include", "define", "endif", "ifndef", "pragma", "aaa", "bbb", "ccc", "ddd", "eee", "fff",
+  "github", "features", "contact", "configuration", "installation", "license", "tools",
+  "start-of-content", "end-of-content", "list-branches", "get-a-repository",
+]);
 
 function isIgnored(filePath) {
   return IGNORE_PATTERNS.some((p) => p.test(filePath));
@@ -63,7 +82,52 @@ function redactSensitive(content) {
     return `${prefix} '[REDACTED]'`;
   });
 
+  // 6. Standalone API key patterns in chat/logs
+  cleaned = cleaned.replace(/\b(sk-[A-Za-z0-9_-]{20,})\b/g, "[REDACTED_KEY]");
+  cleaned = cleaned.replace(/\b(fc_pat_[A-Za-z0-9]{20,})\b/g, "[REDACTED_KEY]");
+  cleaned = cleaned.replace(/\b(?:api[_-]?key|ключ)\s*[:=-]\s*['"]?[A-Za-z0-9_\-=]{16,}['"]?/gi, "[REDACTED_KEY]");
+
   return cleaned;
+}
+
+function stripSessionEnrichment(text) {
+  let s = text;
+  s = s.replace(/Conversation info \(untrusted metadata\):[\s\S]*?```\s*/gi, "");
+  s = s.replace(/Sender \(untrusted metadata\):[\s\S]*?```\s*/gi, "");
+  s = s.replace(/Conversation context \(untrusted[^)]*\):[\s\S]*?(?=\n\n### |\n\n[A-Z#]|\n*$)/gi, "");
+  s = s.replace(/Reply target of current user message[\s\S]*?```\s*/gi, "");
+  s = s.replace(/\[media attached:[^\]]+\]\s*/gi, "");
+  s = s.replace(/^\[Image\]\s*$/gim, "");
+  s = s.replace(/^User text:\s*/gim, "");
+  s = s.replace(/^Description:\s*/gim, "");
+  s = s.replace(/^\[[^\]]+\]\s+[A-Za-z]{3}\s+\d{4}-\d{2}-\d{2}[^\n]*\n/gm, "");
+  return s.trim();
+}
+
+function isLowValueSessionMessage(role, text) {
+  if (!text || text.length < 2) return true;
+  const t = text.trim();
+  if (/^\[OpenClaw heartbeat poll\]$/i.test(t)) return true;
+  if (/^HEARTBEAT_OK$/i.test(t)) return true;
+  if (/^\[assistant turn failed/i.test(t)) return true;
+  if (/^⚠️ Something went wrong while processing/i.test(t)) return true;
+  if (/^NO_REPLY$/i.test(t)) return true;
+  if (role === "tool" && t.length > 4000) return true;
+  return false;
+}
+
+function shouldSkipSessionFile(name) {
+  return SESSION_SKIP_PATTERNS.some((p) => p.test(name));
+}
+
+function shouldSkipWorkspaceMd(name, relPath) {
+  const lower = name.toLowerCase();
+  // Skip boilerplate from cloned repos (keep root-level agent docs)
+  if (lower === "readme.md" && relPath.split("/").length > 2) return true;
+  if (lower === "contributing.md" && relPath.includes("/")) return true;
+  if (lower === "security.md" && relPath.includes("/")) return true;
+  if (lower === "changelog.md" && relPath.includes("/")) return true;
+  return false;
 }
 
 /** Convert any string to a safe, human-readable filename */
@@ -182,6 +246,15 @@ export function ingestFile(filePath, sourceKind, sourceTitle, agent, scope, cfg,
       return 0; // Duplicate, skip
     }
 
+    const vaultSourcesDir = join(cfg.OPENCLAW_MEMORY_VAULT, "sources");
+    mkdirSync(vaultSourcesDir, { recursive: true });
+
+    const existingByPath = db.prepare("SELECT id, title FROM sources WHERE path = ?").get(filePath);
+    if (existingByPath) {
+      const oldSafe = toSafeFilename(existingByPath.title || basename(filePath));
+      deleteVaultPaths(collectVaultPathsForSource(db, filePath, vaultSourcesDir, oldSafe));
+    }
+
     // Clean up chunks from old hash of same file
     db.prepare("DELETE FROM chunk_entities WHERE chunk_id IN (SELECT id FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE path = ?))").run(filePath);
     db.prepare("DELETE FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE path = ?)").run(filePath);
@@ -219,9 +292,6 @@ export function ingestFile(filePath, sourceKind, sourceTitle, agent, scope, cfg,
       INSERT INTO chunks (id, source_id, agent, scope, title, content, markdown_path, token_estimate, content_hash, status, confidence, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1.0, ?, ?)
     `);
-
-    const vaultSourcesDir = join(cfg.OPENCLAW_MEMORY_VAULT, "sources");
-    mkdirSync(vaultSourcesDir, { recursive: true });
 
     const localTitle = sourceTitle || basename(filePath);
     const safeName = toSafeFilename(localTitle);
@@ -264,17 +334,20 @@ export function ingestFile(filePath, sourceKind, sourceTitle, agent, scope, cfg,
         `**Source**: ${sourceWikilink}`,
       ].join("\n");
 
-      try {
-        writeFileSync(mdPath, mdContent, "utf-8");
-      } catch (err) {
-        console.warn(`[memory]  ⚠  Cannot write ${mdPath}: ${err.message}`);
+      const chunkMdPath = cfg.vaultWriteChunks ? mdPath : null;
+      if (cfg.vaultWriteChunks) {
+        try {
+          writeFileSync(mdPath, mdContent, "utf-8");
+        } catch (err) {
+          console.warn(`[memory]  ⚠  Cannot write ${mdPath}: ${err.message}`);
+        }
       }
 
       insertChunk.run(
         chunkId, sourceId, agent, scope,
         `${localTitle} — part ${i + 1}`,
         chunkContent,
-        mdPath,
+        chunkMdPath,
         tokenEstimate(chunkContent),
         chunkHash,
         now(), now(),
@@ -386,6 +459,8 @@ function extractEntities(cfg, db, chunkId, content) {
 
 /** Reject noise topics: pure numbers, hex codes, timestamps, single chars, very short tokens */
 function isMeaningfulTopic(name) {
+  const normalized = name.toLowerCase();
+  if (TOPIC_NOISE.has(normalized)) return false;
   // Too short (< 3 chars after #) — likely noise
   if (name.length < 3) return false;
   // Pure digits — PR numbers, CLI flags, issue IDs
@@ -411,14 +486,11 @@ function canonicalizeJsonl(content, filePath, agent) {
       const entry = JSON.parse(line);
       if (entry.type === "message" && entry.message) {
         const role = entry.message.role || "unknown";
-        const text = extractText(entry.message.content);
-        if (text) {
+        let text = extractText(entry.message.content);
+        if (role === "user") text = stripSessionEnrichment(text);
+        if (text && !isLowValueSessionMessage(role, text)) {
           messages.push({ role, text, ts: entry.timestamp || entry.createdAt });
         }
-      }
-      if (entry.type === "custom" && entry.customType === "tool_execution") {
-        // Store tool calls too
-        messages.push({ role: "tool", text: JSON.stringify(entry.data || {}), ts: entry.timestamp });
       }
     } catch {
       // skip unparseable lines
@@ -452,7 +524,8 @@ function extractText(content) {
     return content
       .map((part) => {
         if (part.type === "text") return part.text || "";
-        if (part.type === "tool_use") return `[Tool: ${part.name}]`;
+        if (part.type === "thinking") return "";
+        if (part.type === "toolCall" || part.type === "tool_use") return `[Tool: ${part.name || "call"}]`;
         if (part.type === "tool_result") {
           if (typeof part.content === "string") return `[Result: ${part.content.substring(0, 500)}]`;
           if (Array.isArray(part.content)) return extractText(part.content);
@@ -466,8 +539,44 @@ function extractText(content) {
   return JSON.stringify(content);
 }
 
+function purgeStaleSources(cfg, db) {
+  const vaultSourcesDir = join(cfg.OPENCLAW_MEMORY_VAULT, "sources");
+  const allSources = db.prepare("SELECT id, path, title FROM sources").all();
+  let removed = 0;
+
+  for (const src of allSources) {
+    const base = basename(src.path);
+    const ext = extname(src.path);
+    let stale = false;
+
+    if (ext === ".jsonl" && shouldSkipSessionFile(base)) stale = true;
+    if (!cfg.workspaceScripts && [".py", ".js", ".sh"].includes(ext)) stale = true;
+    if (ext === ".md") {
+      const rel = relative(cfg.OPENCLAW_WORKSPACE, src.path);
+      if (!rel.startsWith("..") && shouldSkipWorkspaceMd(base, rel)) stale = true;
+    }
+
+    if (!stale) continue;
+
+    const oldSafe = toSafeFilename(src.title || base);
+    deleteVaultPaths(collectVaultPathsForSource(db, src.path, vaultSourcesDir, oldSafe));
+    db.prepare("DELETE FROM chunk_entities WHERE chunk_id IN (SELECT id FROM chunks WHERE source_id = ?)").run(src.id);
+    db.prepare("DELETE FROM chunks WHERE source_id = ?").run(src.id);
+    db.prepare("DELETE FROM summaries WHERE scope = 'source' AND scope_key = ?").run(src.id);
+    db.prepare("DELETE FROM sources WHERE id = ?").run(src.id);
+    removed++;
+  }
+
+  if (removed > 0) {
+    console.log(`[memory]  ✓ Purged ${removed} stale source(s) (checkpoints, scripts, README clones)\n`);
+  }
+  return removed;
+}
+
 export function ingestAllSources(cfg, db) {
   console.log("[memory]  Starting ingestion pipeline...\n");
+
+  purgeStaleSources(cfg, db);
 
   const workspace = cfg.OPENCLAW_WORKSPACE;
   const vault = cfg.OPENCLAW_MEMORY_VAULT;
@@ -484,7 +593,7 @@ export function ingestAllSources(cfg, db) {
     try {
       const files = readdirSync(dir);
       for (const f of files) {
-        if (f.endsWith(".jsonl") && !f.endsWith(".trajectory.jsonl")) {
+        if (f.endsWith(".jsonl") && !shouldSkipSessionFile(f)) {
           sources.push({
             path: join(dir, f),
             kind: "session",
@@ -523,7 +632,11 @@ export function ingestAllSources(cfg, db) {
 
         if (entry.isDirectory()) {
           walkDir(fullPath, baseDir);
-        } else if (entry.isFile() && (entry.name.endsWith(".md") || entry.name.endsWith(".py") || entry.name.endsWith(".js") || entry.name.endsWith(".sh"))) {
+        } else if (entry.isFile()) {
+          const isMd = entry.name.endsWith(".md");
+          const isScript = cfg.workspaceScripts && (entry.name.endsWith(".py") || entry.name.endsWith(".js") || entry.name.endsWith(".sh"));
+          if (!isMd && !isScript) continue;
+          if (isMd && shouldSkipWorkspaceMd(entry.name, relPath)) continue;
           sources.push({
             path: fullPath,
             kind: "workspace",
@@ -588,6 +701,11 @@ export function ingestAllSources(cfg, db) {
     }
   }
 
+  const pruned = pruneOrphanVaultFiles(cfg, db);
+  if (pruned.removedChunks > 0 || pruned.removedSources > 0 || pruned.removedSummaries > 0) {
+    console.log(`[memory]  ✓ Pruned ${pruned.removedChunks} orphan chunk(s), ${pruned.removedSources} source index file(s), ${pruned.removedSummaries || 0} summary file(s)`);
+  }
+
   console.log(`\n[memory]  Done. ${processedFiles} file(s) ingested, ${totalChunks} total chunk(s).`);
-  return { processedFiles, totalChunks };
+  return { processedFiles, totalChunks, pruned };
 }

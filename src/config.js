@@ -27,6 +27,10 @@ export function resolveConfig() {
     chunkMaxTokens: userConfig.chunkMaxTokens || 3000,
     chunkTargetTokens: userConfig.chunkTargetTokens || 1800,
     recallMaxTokens: userConfig.recallMaxTokens || 5000,
+    /** Write full chunk bodies to Obsidian vault/chunks/. SQLite always stores chunks. */
+    vaultWriteChunks: userConfig.vaultWriteChunks !== false,
+    /** Ingest .py/.js/.sh from workspace walk (noisy; off by default). */
+    workspaceScripts: userConfig.workspaceScripts === true,
   };
 }
 

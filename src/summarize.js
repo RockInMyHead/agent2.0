@@ -144,7 +144,7 @@ function summarizeTopics(db, cfg) {
   const topics = db.prepare(`
     SELECT e.id, e.name, e.normalized_name, e.mentions_count
     FROM entities e
-    WHERE e.kind = 'topic' AND e.mentions_count >= 2
+    WHERE e.kind = 'topic' AND e.mentions_count >= 3
     ORDER BY e.mentions_count DESC
   `).all();
 

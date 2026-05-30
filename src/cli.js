@@ -7,6 +7,7 @@ import { createDb, tokenEstimate } from "./db.js";
 import { ingestAllSources, ingestFile } from "./ingest.js";
 import { summarizeAll } from "./summarize.js";
 import { exportDataset } from "./export-dataset.js";
+import { pruneOrphanVaultFiles } from "./vault-cleanup.js";
 import { join, basename } from "node:path";
 
 /** Escape a string for safe use in FTS5 MATCH queries.
@@ -33,6 +34,7 @@ const COMMANDS = [
   "status",
   "open-vault",
   "export-sft",
+  "prune-vault",
   "help",
 ];
 
@@ -52,6 +54,7 @@ COMMANDS:
   status                Show memory statistics
   open-vault            Open Obsidian vault (macOS)
   export-sft [dir]      Export SFT dataset from sessions + Obsidian vault
+  prune-vault           Remove orphan markdown files not referenced in SQLite
   help                  Show this help
 
 ENV:
@@ -430,6 +433,15 @@ function cmdStatus(cfg) {
   }
 }
 
+function cmdPruneVault(cfg) {
+  console.log("[memory]  Pruning orphan Obsidian vault files...\n");
+  ensureDirectories(cfg);
+  const { db } = createDb(cfg.OPENCLAW_MEMORY_DB);
+  const pruned = pruneOrphanVaultFiles(cfg, db);
+  db.close();
+  console.log(`[memory]  ✓ Removed ${pruned.removedChunks} orphan chunk(s), ${pruned.removedSources} orphan source index file(s), ${pruned.removedSummaries || 0} orphan summary file(s).\n`);
+}
+
 function cmdExportSft(cfg, outArg) {
   const outDir = outArg || join(cfg.OPENCLAW_HOME, "datasets", `agent-sft-${new Date().toISOString().slice(0, 10)}`);
   console.log(`[memory]  Exporting SFT dataset → ${outDir}\n`);
@@ -505,5 +517,8 @@ switch (cmd) {
     break;
   case "export-sft":
     cmdExportSft(cfg, query);
+    break;
+  case "prune-vault":
+    cmdPruneVault(cfg);
     break;
 }
